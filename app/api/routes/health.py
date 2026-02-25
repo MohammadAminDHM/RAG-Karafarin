@@ -1,4 +1,4 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from app.core.config import get_settings
 
 router = APIRouter(tags=["health"])
@@ -16,14 +16,17 @@ def health() -> dict:
 
 
 @router.get("/ready")
-def ready() -> dict:
-    # In later phases we will check vector DB, model connectivity, etc.
+def ready(request: Request) -> dict:
+    report = getattr(request.app.state, "ingestion_report", None)
+    pipeline_ready = getattr(request.app.state, "rag_pipeline", None) is not None
+
     return {
-        "status": "ready",
+        "status": "ready" if pipeline_ready else "not_ready",
         "checks": {
             "api": True,
-            "vectorstore": "not_checked_yet",
-            "local_provider": "not_checked_yet",
-            "api_provider": "not_checked_yet",
+            "rag_pipeline": pipeline_ready,
+            "ingestion": report or "not_run",
+            "local_provider": "not_connected_in_phase1",
+            "api_provider": "not_connected_in_phase1",
         },
     }
