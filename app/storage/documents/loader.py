@@ -5,65 +5,19 @@ from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
 
-def _record_to_text(obj: Any) -> str:
-    """
-    Convert a JSONL record to a text string for embedding.
-    Priority:
-      - text / content / body
-      - question/answer or q/a
-      - prompt/completion
-      - fallback: JSON string
-    """
-    if obj is None:
-        return ""
-
-    if isinstance(obj, str):
-        return obj.strip()
-
-    if not isinstance(obj, dict):
-        # fallback for numbers/lists etc.
-        try:
-            return json.dumps(obj, ensure_ascii=False)
-        except Exception:
-            return str(obj).strip()
-
-    # Common direct text fields
-    for k in ("text", "content", "body", "document", "message"):
-        v = obj.get(k)
+def _pick_first_str(d: dict, keys: List[str]) -> str:
+    for k in keys:
+        v = d.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
-
-    # QA style
-    q = obj.get("question") or obj.get("q") or obj.get("query")
-    a = obj.get("answer") or obj.get("a") or obj.get("response") or obj.get("completion")
-    if isinstance(q, str) and q.strip():
-        if isinstance(a, str) and a.strip():
-            return f"Question: {q.strip()}\nAnswer: {a.strip()}"
-        return f"Question: {q.strip()}"
-
-    # prompt/completion pair
-    p = obj.get("prompt")
-    c = obj.get("completion")
-    if isinstance(p, str) and p.strip():
-        if isinstance(c, str) and c.strip():
-            return f"Prompt: {p.strip()}\nCompletion: {c.strip()}"
-        return f"Prompt: {p.strip()}"
-
-    # fallback: entire object as text
-    try:
-        return json.dumps(obj, ensure_ascii=False)
-    except Exception:
-        return str(obj).strip()
+    return ""
 
 
 def load_source_documents(path: str) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """
-    Load a source file and return a list of documents:
-      [{ "doc_id": "...", "text": "...", "meta": {...} }, ...]
-
     Supports:
-      - .txt -> single document
-      - .jsonl -> one document per line (record)
+      - .jsonl (each line a record) -> returns docs with {doc_id, question, answer, meta}
+      - .txt -> a single doc with {text}
     """
     file_path = Path(path)
     report: Dict[str, Any] = {
@@ -71,7 +25,6 @@ def load_source_documents(path: str) -> Tuple[List[Dict[str, Any]], Dict[str, An
         "exists": file_path.exists(),
         "file_type": file_path.suffix.lower(),
     }
-
     if not file_path.exists():
         return [], report
 
@@ -84,53 +37,53 @@ def load_source_documents(path: str) -> Tuple[List[Dict[str, Any]], Dict[str, An
         skipped = 0
         bad_json = 0
 
-        for line in file_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+        lines = file_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        for i, line in enumerate(lines):
             total += 1
-            s = line.strip()
+            s = (line or "").strip()
             if not s:
                 skipped += 1
                 continue
-
             try:
                 obj = json.loads(s)
             except Exception:
                 bad_json += 1
                 continue
-
-            text = _record_to_text(obj)
-            if not text.strip():
+            if not isinstance(obj, dict):
                 skipped += 1
                 continue
 
-            docs.append(
-                {
-                    "doc_id": f"jsonl-{parsed:06d}",
-                    "text": text,
-                    "meta": {
-                        "record_index": parsed,
-                    },
-                }
-            )
+            q = _pick_first_str(obj, ["question","q","query","prompt","title","input"])
+            a = _pick_first_str(obj, ["answer","a","response","completion","output"])
+
+            # fallback: if the record has text/content, treat it as q (still fine for embedding)
+            if not q:
+                q = _pick_first_str(obj, ["text","content","body","message","document"])
+            if not q:
+                skipped += 1
+                continue
+
+            docs.append({
+                "doc_id": f"jsonl-{parsed:06d}",
+                "question": q,
+                "answer": a,
+                "meta": {"record_index": parsed},
+            })
             parsed += 1
 
-        report.update(
-            {
-                "jsonl_total_lines": total,
-                "jsonl_parsed_records": parsed,
-                "jsonl_skipped": skipped,
-                "jsonl_bad_json": bad_json,
-            }
-        )
+        report.update({
+            "jsonl_total_lines": total,
+            "jsonl_parsed_records": parsed,
+            "jsonl_skipped": skipped,
+            "jsonl_bad_json": bad_json,
+        })
         return docs, report
 
-    # Default: treat as plain text
+    # plain text fallback
     text = file_path.read_text(encoding="utf-8", errors="ignore").strip()
-    docs = [
-        {
-            "doc_id": "doc-000000",
-            "text": text,
-            "meta": {},
-        }
-    ]
     report.update({"raw_chars": len(text)})
-    return docs, report
+    return [{
+        "doc_id": "doc-000000",
+        "text": text,
+        "meta": {},
+    }], report

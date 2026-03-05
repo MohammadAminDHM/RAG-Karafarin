@@ -60,36 +60,37 @@ class OllamaEmbedder:
                 resp.raise_for_status()
                 return self._parse_embedding_response(resp.json())
 
-    def embed_many(self, texts: Iterable[str]) -> List[List[float]]:
-        cleaned: List[str] = [((t or "").strip()) for t in texts]
+    def _embed_batch(self, client: httpx.Client, batch: List[str]) -> List[List[float]]:
+        """Send one mini-batch; returns list of vectors or raises."""
+        resp = client.post(
+            f"{self.base_url}/api/embed",
+            json={"model": self.model, "input": batch},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if "embeddings" in data and isinstance(data["embeddings"], list):
+            rows = data["embeddings"]
+            if rows and isinstance(rows[0], list):
+                return [[float(x) for x in row] for row in rows]
+        raise ValueError(f"Unexpected batch response format: {list(data.keys())}")
+
+    def embed_many(self, texts: Iterable[str], batch_size: int = 32) -> List[List[float]]:
+        cleaned: List[str] = [(t or "").strip() for t in texts]
         cleaned = [t for t in cleaned if t]
         if not cleaned:
             return []
 
-        # Try batch endpoint first
+        results: List[List[float]] = []
         with httpx.Client(timeout=self.timeout_sec) as client:
-            try:
-                resp = client.post(
-                    f"{self.base_url}/api/embed",
-                    json={"model": self.model, "input": cleaned},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-
-                if "embeddings" in data and isinstance(data["embeddings"], list):
-                    # Expected batch shape: list[list[float]]
-                    if data["embeddings"] and isinstance(data["embeddings"][0], list):
-                        return [
-                            [float(x) for x in row]
-                            for row in data["embeddings"]
-                        ]
-
-                # If format is unexpected, fall back to single-call loop
-            except Exception:
-                pass
-
-        # Safe fallback: single-call embedding
-        return [self.embed_text(t) for t in cleaned]
+            for i in range(0, len(cleaned), batch_size):
+                batch = cleaned[i : i + batch_size]
+                try:
+                    results.extend(self._embed_batch(client, batch))
+                except Exception:
+                    # Per-item fallback for this batch only
+                    for text in batch:
+                        results.append(self.embed_text(text))
+        return results
 
     @staticmethod
     def infer_dimension(vec: Sequence[float]) -> int:

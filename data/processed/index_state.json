@@ -1,0 +1,8 @@
+{
+  "index_schema_version": 3,
+  "index_mode": "qa_full",
+  "source_path": "./data/input/Karafarin_QA_enriched.jsonl",
+  "source_hash": "0f5dcca902f535261ae93ee4ebdb34c67f05598980728ba3571b7fa3efa21167",
+  "embedding_model": "qwen3-embedding:8b",
+  "items_indexed": 1545
+}

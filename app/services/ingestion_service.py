@@ -2,49 +2,19 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple, List
 
 from app.core.config import Settings
 from app.rag.pipeline import RAGPipeline
 from app.rag.retriever import RAGRetriever
-from app.storage.documents.cleaner import clean_text
-from app.storage.documents.chunker import chunk_text
 from app.storage.documents.loader import load_source_documents
 from app.storage.embeddings.embedder import OllamaEmbedder
 from app.storage.vectorstore.faiss_store import FaissStore
 from app.utils.hashing import sha256_file
+from app.services.text_normalizer import normalize_chars_fa
 
 
-def _build_chunks_from_docs(
-    docs: List[Dict[str, Any]],
-    chunk_size: int,
-    chunk_overlap: int,
-) -> List[Dict[str, Any]]:
-    all_chunks: List[Dict[str, Any]] = []
-    for doc_i, d in enumerate(docs):
-        doc_id = d.get("doc_id", f"doc-{doc_i:06d}")
-        meta = d.get("meta", {}) or {}
-        cleaned = clean_text(d.get("text", "") or "")
-        if not cleaned.strip():
-            continue
-
-        base_chunks = chunk_text(cleaned, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-        for ci, c in enumerate(base_chunks):
-            all_chunks.append(
-                {
-                    "chunk_id": f"{doc_id}_chunk-{ci:04d}",
-                    "text": c["text"],
-                    "start": c["start"],
-                    "end": c["end"],
-                    "doc_id": doc_id,
-                    "doc_index": doc_i,
-                    **meta,
-                }
-            )
-    return all_chunks
-
-
-def _load_index_state(path: str) -> Dict[str, Any]:
+def _load_state(path: str) -> Dict[str, Any]:
     p = Path(path)
     if not p.exists():
         return {}
@@ -53,130 +23,139 @@ def _load_index_state(path: str) -> Dict[str, Any]:
     except Exception:
         return {}
 
-
-def _save_index_state(path: str, state: Dict[str, Any]) -> None:
+def _save_state(path: str, state: Dict[str, Any]) -> None:
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def build_pipeline_from_existing_index(settings: Settings) -> Tuple[Optional[RAGPipeline], Dict[str, Any]]:
-    """
-    Fast path:
-    - If FAISS index exists AND file hash hasn't changed => load only.
-    - No chunking/embedding.
-    """
     source_hash = sha256_file(settings.static_source_path)
-    state = _load_index_state(settings.index_state_path)
+    state = _load_state(settings.index_state_path)
 
-    # Must have index files
+    # Require schema match (forces one-time rebuild when we change index design)
+    if not state:
+        return None, {"loaded": False, "reason": "missing_index_state", "source_hash": source_hash}
+
+    if int(state.get("index_schema_version", -1)) != int(settings.index_schema_version):
+        return None, {"loaded": False, "reason": "schema_version_mismatch", "state": state}
+
+    if str(state.get("index_mode", "")) != str(settings.index_mode):
+        return None, {"loaded": False, "reason": "index_mode_mismatch", "state": state}
+
+    if str(state.get("embedding_model", "")) != str(settings.ollama_embed_model):
+        return None, {"loaded": False, "reason": "embedding_model_mismatch", "state": state}
+
+    if str(state.get("source_hash", "")) != str(source_hash):
+        return None, {"loaded": False, "reason": "source_changed", "prev_hash": state.get("source_hash"), "source_hash": source_hash}
+
     store = FaissStore(
         index_path=settings.faiss_index_path,
         metadata_path=settings.faiss_metadata_path,
         embedding_dim=settings.embedding_dim,
     )
-    has_index = store.load()
-
-    # If index missing => cannot load
-    if not has_index:
-        return None, {
-            "loaded": False,
-            "reason": "faiss_index_missing",
-            "source_hash": source_hash,
-        }
-
-    # If hash mismatch => rebuild needed
-    prev_hash = state.get("source_hash", "")
-    if prev_hash and source_hash and prev_hash != source_hash:
-        return None, {
-            "loaded": False,
-            "reason": "source_changed",
-            "prev_hash": prev_hash,
-            "source_hash": source_hash,
-        }
+    if not store.load():
+        return None, {"loaded": False, "reason": "faiss_missing_or_unreadable"}
 
     embedder = OllamaEmbedder(
         base_url=settings.ollama_base_url,
         model=settings.ollama_embed_model,
         timeout_sec=settings.ollama_embed_timeout_sec,
     )
+    retriever = RAGRetriever(store=store, embedder=embedder)
+    pipeline = RAGPipeline(retriever=retriever, max_context_chars=settings.max_context_chars)
+
+    return pipeline, {
+        "loaded": True,
+        "reason": "loaded_from_disk",
+        "source_hash": source_hash,
+        "index_state": state,
+    }
+
+
+def rebuild_index_and_pipeline(settings: Settings) -> Tuple[RAGPipeline, Dict[str, Any]]:
+    docs, load_report = load_source_documents(settings.static_source_path)
+
+    embedder = OllamaEmbedder(
+        base_url=settings.ollama_base_url,
+        model=settings.ollama_embed_model,
+        timeout_sec=settings.ollama_embed_timeout_sec,
+    )
+
+    store = FaissStore(
+        index_path=settings.faiss_index_path,
+        metadata_path=settings.faiss_metadata_path,
+        embedding_dim=settings.embedding_dim,
+    )
+
+    items: List[Dict[str, Any]] = []
+    embed_inputs: List[str] = []
+
+    # qa_full: embed question + answer together.
+    # Best for support FAQs where users describe their problem using words
+    # that appear in the answer, not necessarily the question.
+    if settings.index_mode in ("qa_full", "qa_question_only"):
+        full_mode = settings.index_mode == "qa_full"
+        for d in docs:
+            q = (d.get("question") or "").strip()
+            if not q:
+                continue
+            a = (d.get("answer") or "").strip()
+            doc_id = d.get("doc_id")
+            ri = (d.get("meta") or {}).get("record_index")
+
+            items.append({
+                "chunk_id": f"{doc_id}",
+                "doc_id": doc_id,
+                "record_index": ri,
+                "question": q,
+                "answer": a,
+            })
+            if full_mode and a:
+                # Embed both sides so queries phrased like the answer also match
+                embed_text = normalize_chars_fa(q + " " + a)
+            else:
+                embed_text = normalize_chars_fa(q)
+            embed_inputs.append(embed_text)
+
+    # Generic fallback for plain-text documents
+    else:
+        for d in docs:
+            text = (d.get("text") or "").strip()
+            if not text:
+                continue
+            items.append({
+                "chunk_id": d.get("doc_id"),
+                "doc_id": d.get("doc_id"),
+                "question": text[:200],
+                "answer": "",
+            })
+            embed_inputs.append(normalize_chars_fa(text))
+
+    embeddings = embedder.embed_many(embed_inputs) if embed_inputs else []
+    store.build_from_embeddings(items=items, embeddings=embeddings)
+    store.save()
+
+    source_hash = sha256_file(settings.static_source_path)
+    state = {
+        "index_schema_version": settings.index_schema_version,
+        "index_mode": settings.index_mode,
+        "source_path": settings.static_source_path,
+        "source_hash": source_hash,
+        "embedding_model": settings.ollama_embed_model,
+        "items_indexed": len(items),
+    }
+    _save_state(settings.index_state_path, state)
+
     retriever = RAGRetriever(store=store, embedder=embedder)
     pipeline = RAGPipeline(retriever=retriever, max_context_chars=settings.max_context_chars)
 
     report = {
-        "loaded": True,
-        "indexed": True,
-        "reason": "loaded_from_disk",
-        "faiss_index_path": settings.faiss_index_path,
-        "faiss_metadata_path": settings.faiss_metadata_path,
-        "index_state_path": settings.index_state_path,
-        "source_hash": source_hash,
-        "prev_hash": prev_hash,
-    }
-    return pipeline, report
-
-
-def rebuild_index_and_pipeline(settings: Settings) -> Tuple[RAGPipeline, Dict[str, Any]]:
-    """
-    Slow path:
-    - Load (txt/jsonl)
-    - Chunk
-    - Embed chunks with Ollama
-    - Build + persist FAISS
-    - Save state with source hash
-    """
-    embedder = OllamaEmbedder(
-        base_url=settings.ollama_base_url,
-        model=settings.ollama_embed_model,
-        timeout_sec=settings.ollama_embed_timeout_sec,
-    )
-
-    docs, load_report = load_source_documents(settings.static_source_path)
-    chunks = _build_chunks_from_docs(docs, settings.chunk_size, settings.chunk_overlap)
-
-    store = FaissStore(
-        index_path=settings.faiss_index_path,
-        metadata_path=settings.faiss_metadata_path,
-        embedding_dim=settings.embedding_dim,
-    )
-
-    embedding_dim_actual = None
-    if chunks:
-        texts = [c["text"] for c in chunks]
-        embeddings = embedder.embed_many(texts)
-        if len(embeddings) != len(chunks):
-            raise ValueError(f"Ollama embedding count mismatch: {len(embeddings)} != {len(chunks)}")
-        embedding_dim_actual = len(embeddings[0]) if embeddings and embeddings[0] else None
-        store.build_from_embeddings(chunks=chunks, embeddings=embeddings)
-        store.save()
-    else:
-        store.build_from_embeddings(chunks=[], embeddings=[])
-
-    source_hash = sha256_file(settings.static_source_path)
-    _save_index_state(settings.index_state_path, {
-        "source_path": settings.static_source_path,
-        "source_hash": source_hash,
-        "chunk_count": len(chunks),
-        "embedding_model": settings.ollama_embed_model,
-        "embedding_dim_actual": embedding_dim_actual,
-    })
-
-    retriever = RAGRetriever(store=store, embedder=embedder)
-    pipeline = RAGPipeline(retriever=retriever, max_context_chars=settings.max_context_chars)
-
-    report: Dict[str, Any] = {
         **load_report,
         "loaded": False,
-        "indexed": bool(chunks),
-        "reason": "rebuilt",
-        "doc_count": len(docs),
-        "chunk_count": len(chunks),
-        "faiss_index_path": settings.faiss_index_path,
-        "faiss_metadata_path": settings.faiss_metadata_path,
-        "index_state_path": settings.index_state_path,
+        "reason": "rebuilt_question_only",
+        "items_indexed": len(items),
         "source_hash": source_hash,
-        "embedding_model": settings.ollama_embed_model,
-        "embedding_dim_config": settings.embedding_dim,
-        "embedding_dim_actual": embedding_dim_actual,
+        "index_state": state,
     }
     return pipeline, report

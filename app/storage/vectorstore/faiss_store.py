@@ -9,18 +9,10 @@ import numpy as np
 
 
 class FaissStore:
-    """
-    FAISS store with cosine-like similarity using normalized vectors + IndexFlatIP.
-    Persists:
-      - index file
-      - metadata JSON aligned with FAISS row ids
-    """
-
     def __init__(self, index_path: str, metadata_path: str, embedding_dim: int = 0) -> None:
         self.index_path = Path(index_path)
         self.metadata_path = Path(metadata_path)
         self.embedding_dim = int(embedding_dim or 0)
-
         self.index = None
         self.metadata: List[Dict] = []
 
@@ -76,14 +68,14 @@ class FaissStore:
         self.embedding_dim = int(self.index.d)
         return True
 
-    def build_from_embeddings(self, chunks: List[Dict], embeddings: Sequence[Sequence[float]]) -> None:
-        if not chunks:
+    def build_from_embeddings(self, items: List[Dict], embeddings: Sequence[Sequence[float]]) -> None:
+        if not items:
             self.index = None
             self.metadata = []
             return
 
-        if len(chunks) != len(embeddings):
-            raise ValueError(f"Chunks/embeddings mismatch: {len(chunks)} != {len(embeddings)}")
+        if len(items) != len(embeddings):
+            raise ValueError(f"Items/embeddings mismatch: {len(items)} != {len(embeddings)}")
 
         matrix = self._to_float32_2d(embeddings)
         inferred_dim = int(matrix.shape[1])
@@ -97,16 +89,12 @@ class FaissStore:
         matrix = self._l2_normalize_rows(matrix)
         self.index.add(matrix)
 
-        # Persist useful metadata (includes doc_id / record_index if present)
-        keep_keys = ("chunk_id", "text", "start", "end", "doc_id", "doc_index", "record_index")
+        keep_keys = ("chunk_id","doc_id","record_index","question","answer")
         self.metadata = []
-        for c in chunks:
-            meta = {k: c.get(k) for k in keep_keys if k in c}
-            # Ensure minimum fields
-            meta.setdefault("chunk_id", c.get("chunk_id"))
-            meta.setdefault("text", c.get("text", ""))
-            meta.setdefault("start", c.get("start"))
-            meta.setdefault("end", c.get("end"))
+        for it in items:
+            meta = {k: it.get(k) for k in keep_keys if k in it}
+            meta.setdefault("chunk_id", it.get("chunk_id"))
+            meta.setdefault("doc_id", it.get("doc_id"))
             self.metadata.append(meta)
 
     def search(self, query_vector: Sequence[float], top_k: int = 5) -> List[Dict]:
@@ -121,14 +109,12 @@ class FaissStore:
 
         q = self._l2_normalize_vector(q).reshape(1, -1)
         k = max(1, min(int(top_k), len(self.metadata) if self.metadata else 1))
-
         scores, indices = self.index.search(q, k)
-        out: List[Dict] = []
 
+        out: List[Dict] = []
         for score, idx in zip(scores[0].tolist(), indices[0].tolist()):
             if idx < 0 or idx >= len(self.metadata):
                 continue
             meta = self.metadata[idx]
             out.append({**meta, "score": float(score)})
-
         return out
