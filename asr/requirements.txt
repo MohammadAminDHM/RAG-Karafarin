@@ -1,0 +1,10 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.0
+python-multipart==0.0.9
+vosk==0.3.45
+librosa==0.10.2.post1
+soundfile==0.12.1
+numpy==1.26.4
+pydantic==2.7.1
+pydub==0.25.1
+ffmpeg-python==0.2.0

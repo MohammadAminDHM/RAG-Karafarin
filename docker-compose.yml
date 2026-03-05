@@ -1,0 +1,85 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Karafarin Voice+Text Chatbot – full stack
+#
+# Services:
+#   asr   – Persian ASR  (FastAPI  → port 8080)
+#   rag   – RAG chatbot  (FastAPI  → port 8000)
+#   ui    – Streamlit UI (port 8501)
+#
+# Prerequisites (already on disk – no download step needed):
+#   • asr/models/vosk-model-fa-0.5   (Vosk Persian model)
+#   • data/indexes/faiss.index        (pre-built FAISS index)
+#   • .env                            (see .env.example)
+#
+# Ollama:
+#   Ollama runs on the host. The rag service reaches it via
+#   http://host.docker.internal:11434  (Docker Desktop on Windows/macOS).
+#   Make sure OLLAMA_BASE_URL is set correctly in .env.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+
+  # ── ASR service ─────────────────────────────────────────────────────────────
+  asr:
+    build:
+      context: ./asr
+    container_name: asr_service
+    ports:
+      - "8080:8080"
+    volumes:
+      # bind-mount the already-downloaded model directory
+      - ./asr/models:/app/models:ro
+    environment:
+      - VOSK_MODEL_DIR=/app/models
+      - VOSK_MODEL_NAME=vosk-model-fa-0.5
+      - PORT=8080
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  # ── RAG service ─────────────────────────────────────────────────────────────
+  rag:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    container_name: rag_service
+    ports:
+      - "8000:8000"
+    volumes:
+      # bind-mount pre-built index and knowledge base (read/write for index rebuild)
+      - ./data:/app/data
+    env_file:
+      - .env
+    extra_hosts:
+      # lets the container reach Ollama running on the host
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')"]
+      interval: 30s
+      timeout: 10s
+      start_period: 40s
+      retries: 3
+
+  # ── Streamlit UI ─────────────────────────────────────────────────────────────
+  ui:
+    build:
+      context: ./asr/ui
+    container_name: chatbot_ui
+    ports:
+      - "8501:8501"
+    environment:
+      - ASR_SERVICE_URL=http://asr:8080
+      - RAG_SERVICE_URL=http://rag:8000
+    restart: unless-stopped
+    depends_on:
+      asr:
+        condition: service_healthy
+      rag:
+        condition: service_healthy

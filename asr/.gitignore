@@ -1,0 +1,7 @@
+__pycache__
+.env
+asr.log
+summerize.log
+docker-images/
+*.tar
+models/

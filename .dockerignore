@@ -1,0 +1,16 @@
+# Don't copy large data files or indexes into the image.
+# They are mounted as volumes at runtime.
+data/
+asr/models/
+asr/ui/
+
+# Dev artifacts
+__pycache__/
+**/__pycache__/
+*.pyc
+*.pyo
+.env
+.git/
+.gitignore
+*.md
+docker/

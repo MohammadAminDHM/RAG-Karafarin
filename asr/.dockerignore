@@ -1,0 +1,8 @@
+models/
+__pycache__/
+**/__pycache__/
+*.pyc
+.env
+*.tar
+docker-images/
+*.log

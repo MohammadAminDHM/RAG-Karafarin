@@ -1,0 +1,28 @@
+version: "3.8"
+services:
+  download_model:
+    build: .
+    container_name: stt_download_model
+    command: ["python", "scripts/download_vosk_model.py"]
+    volumes:
+      - ./models:/app/models
+    environment:
+      - VOSK_MODEL_DIR=/app/models
+      - VOSK_MODEL_NAME=vosk-model-fa-0.5
+
+  web:
+    build: .
+    container_name: stt_web
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+    environment:
+      - VOSK_MODEL_DIR=/app/models
+      - VOSK_MODEL_NAME=vosk-model-fa-0.5
+      - PORT=8080
+    restart: unless-stopped
+    depends_on:
+      download_model:
+        condition: service_completed_successfully
+
